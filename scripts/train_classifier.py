@@ -7,28 +7,27 @@ from pathlib import Path
 import numpy as np
 from scipy.io import wavfile
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    roc_auc_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    classification_report,
-)
-
 from extract_features import (
     extract_features,
     FEATURE_NAMES,
 )
 
 
-# ---------------------------------------------------------
-# WAV loading
-# ---------------------------------------------------------
+# =========================================================
+# CONFIG
+# =========================================================
+
+HIDDEN_UNITS = 12
+LEARNING_RATE = 0.001
+EPOCHS = 300
+BATCH_SIZE = 64
+L2 = 1e-4
+RANDOM_SEED = 42
+
+
+# =========================================================
+# WAV LOADING
+# =========================================================
 
 def load_wav(path):
 
@@ -36,25 +35,20 @@ def load_wav(path):
 
     audio = np.asarray(audio)
 
-    # Convert stereo -> mono
+    # Stereo -> mono
     if audio.ndim == 2:
         audio = np.mean(
             audio.astype(np.float64),
             axis=1,
         )
     else:
-        audio = audio.astype(
-            np.float64
-        )
+        audio = audio.astype(np.float64)
 
     # Normalize PCM
-    if np.issubdtype(
-        audio.dtype,
-        np.integer,
-    ):
+    if np.issubdtype(audio.dtype, np.integer):
         info = np.iinfo(audio.dtype)
 
-        max_abs = max(
+        max_abs = np.maximum(
             abs(info.min),
             abs(info.max),
         )
@@ -69,9 +63,9 @@ def load_wav(path):
     return sample_rate, audio
 
 
-# ---------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------
+# =========================================================
+# DATASET LOADING
+# =========================================================
 
 def load_dataset(data_dir):
 
@@ -100,11 +94,10 @@ def load_dataset(data_dir):
         )
 
         print(
-            f"{folder}: "
-            f"{len(wav_files)} files"
+            f"{folder}: {len(wav_files)} files"
         )
 
-        for wav_path in wav_files:
+        for index, wav_path in enumerate(wav_files):
 
             try:
 
@@ -117,11 +110,12 @@ def load_dataset(data_dir):
                     sample_rate,
                 )
 
-                vector = result["vector"]
+                vector = np.asarray(
+                    result["vector"],
+                    dtype=np.float64,
+                )
 
-                if len(vector) != len(
-                    FEATURE_NAMES
-                ):
+                if len(vector) != len(FEATURE_NAMES):
                     raise ValueError(
                         f"Expected "
                         f"{len(FEATURE_NAMES)} "
@@ -131,9 +125,14 @@ def load_dataset(data_dir):
 
                 X.append(vector)
                 y.append(label)
-                paths.append(
-                    str(wav_path)
-                )
+                paths.append(str(wav_path))
+
+                # Progress every 100 files
+                if (index + 1) % 100 == 0:
+                    print(
+                        f"  {index + 1}/"
+                        f"{len(wav_files)}"
+                    )
 
             except Exception as e:
 
@@ -161,9 +160,577 @@ def load_dataset(data_dir):
     return X, y, paths
 
 
-# ---------------------------------------------------------
-# Main
-# ---------------------------------------------------------
+# =========================================================
+# TRAIN / TEST SPLIT
+# =========================================================
+
+def train_test_split_manual(
+    X,
+    y,
+    test_size=0.20,
+    seed=42,
+):
+
+    rng = np.random.default_rng(seed)
+
+    train_indices = []
+    test_indices = []
+
+    for label in [0, 1]:
+
+        indices = np.where(y == label)[0]
+
+        rng.shuffle(indices)
+
+        n_test = max(
+            1,
+            int(len(indices) * test_size)
+        )
+
+        test_indices.extend(
+            indices[:n_test]
+        )
+
+        train_indices.extend(
+            indices[n_test:]
+        )
+
+    rng.shuffle(train_indices)
+    rng.shuffle(test_indices)
+
+    return (
+        X[train_indices],
+        X[test_indices],
+        y[train_indices],
+        y[test_indices],
+    )
+
+
+# =========================================================
+# STANDARDIZATION
+# =========================================================
+
+def fit_scaler(X):
+
+    mean = np.mean(
+        X,
+        axis=0,
+    )
+
+    std = np.std(
+        X,
+        axis=0,
+    )
+
+    # Prevent division by zero
+    std = np.where(
+        std < 1e-8,
+        1.0,
+        std,
+    )
+
+    return mean, std
+
+
+def standardize(
+    X,
+    mean,
+    std,
+):
+
+    return (
+        X - mean
+    ) / std
+
+
+# =========================================================
+# ACTIVATION
+# =========================================================
+
+def relu(x):
+
+    return np.maximum(
+        0.0,
+        x,
+    )
+
+
+def relu_derivative(x):
+
+    return (
+        x > 0
+    ).astype(np.float64)
+
+
+def sigmoid(x):
+
+    # Stable sigmoid
+    x = np.clip(
+        x,
+        -50.0,
+        50.0,
+    )
+
+    return 1.0 / (
+        1.0 + np.exp(-x)
+    )
+
+
+# =========================================================
+# MODEL INITIALIZATION
+# =========================================================
+
+def initialize_model(
+    input_dim,
+    hidden_dim,
+    seed=42,
+):
+
+    rng = np.random.default_rng(seed)
+
+    # He initialization
+    W1 = (
+        rng.normal(
+            0.0,
+            np.sqrt(
+                2.0 / input_dim
+            ),
+            size=(
+                hidden_dim,
+                input_dim,
+            ),
+        )
+    )
+
+    b1 = np.zeros(
+        hidden_dim,
+        dtype=np.float64,
+    )
+
+    W2 = (
+        rng.normal(
+            0.0,
+            np.sqrt(
+                2.0 / hidden_dim
+            ),
+            size=(
+                1,
+                hidden_dim,
+            ),
+        )
+    )
+
+    b2 = np.zeros(
+        1,
+        dtype=np.float64,
+    )
+
+    return W1, b1, W2, b2
+
+
+# =========================================================
+# FORWARD PASS
+# =========================================================
+
+def forward(
+    X,
+    W1,
+    b1,
+    W2,
+    b2,
+):
+
+    z1 = (
+        X @ W1.T
+    ) + b1
+
+    a1 = relu(z1)
+
+    z2 = (
+        a1 @ W2.T
+    ) + b2
+
+    probabilities = sigmoid(
+        z2
+    ).reshape(-1)
+
+    return (
+        z1,
+        a1,
+        probabilities,
+    )
+
+
+# =========================================================
+# TRAINING
+# =========================================================
+
+def train_model(
+    X,
+    y,
+    input_dim,
+    hidden_dim=12,
+    learning_rate=0.001,
+    epochs=300,
+    batch_size=64,
+    l2=1e-4,
+    seed=42,
+):
+
+    rng = np.random.default_rng(seed)
+
+    W1, b1, W2, b2 = initialize_model(
+        input_dim,
+        hidden_dim,
+        seed,
+    )
+
+    n_samples = len(X)
+
+    for epoch in range(epochs):
+
+        indices = np.arange(
+            n_samples
+        )
+
+        rng.shuffle(indices)
+
+        X_shuffled = X[indices]
+        y_shuffled = y[indices]
+
+        epoch_loss = 0.0
+
+        for start in range(
+            0,
+            n_samples,
+            batch_size,
+        ):
+
+            end = min(
+                start + batch_size,
+                n_samples,
+            )
+
+            xb = X_shuffled[
+                start:end
+            ]
+
+            yb = y_shuffled[
+                start:end
+            ]
+
+            batch_n = len(xb)
+
+            # -------------------------------------------------
+            # Forward
+            # -------------------------------------------------
+
+            z1, a1, probabilities = forward(
+                xb,
+                W1,
+                b1,
+                W2,
+                b2,
+            )
+
+            # -------------------------------------------------
+            # Binary cross entropy
+            # -------------------------------------------------
+
+            p = np.clip(
+                probabilities,
+                1e-7,
+                1.0 - 1e-7,
+            )
+
+            loss = -np.mean(
+                yb * np.log(p)
+                + (
+                    1.0 - yb
+                ) * np.log(
+                    1.0 - p
+                )
+            )
+
+            # L2 regularization
+            loss += (
+                l2
+                * (
+                    np.sum(W1 * W1)
+                    + np.sum(W2 * W2)
+                )
+                / 2.0
+            )
+
+            epoch_loss += (
+                loss * batch_n
+            )
+
+            # -------------------------------------------------
+            # Backpropagation
+            # -------------------------------------------------
+
+            dz2 = (
+                probabilities - yb
+            ).reshape(
+                -1,
+                1,
+            )
+
+            dW2 = (
+                dz2.T @ a1
+            ) / batch_n
+
+            db2 = np.mean(
+                dz2,
+                axis=0,
+            )
+
+            da1 = (
+                dz2 @ W2
+            )
+
+            dz1 = (
+                da1
+                * relu_derivative(z1)
+            )
+
+            dW1 = (
+                dz1.T @ xb
+            ) / batch_n
+
+            db1 = np.mean(
+                dz1,
+                axis=0,
+            )
+
+            # L2
+            dW1 += l2 * W1
+            dW2 += l2 * W2
+
+            # -------------------------------------------------
+            # Gradient update
+            # -------------------------------------------------
+
+            W1 -= (
+                learning_rate
+                * dW1
+            )
+
+            b1 -= (
+                learning_rate
+                * db1
+            )
+
+            W2 -= (
+                learning_rate
+                * dW2
+            )
+
+            b2 -= (
+                learning_rate
+                * db2
+            )
+
+        epoch_loss /= n_samples
+
+        # Print progress
+        if (
+            epoch == 0
+            or (epoch + 1) % 10 == 0
+        ):
+
+            _, _, train_prob = forward(
+                X,
+                W1,
+                b1,
+                W2,
+                b2,
+            )
+
+            train_pred = (
+                train_prob >= 0.5
+            ).astype(int)
+
+            train_acc = np.mean(
+                train_pred == y
+            )
+
+            print(
+                f"Epoch {epoch + 1:3d}/"
+                f"{epochs} | "
+                f"Loss: {epoch_loss:.6f} | "
+                f"Train Acc: "
+                f"{train_acc:.4f}"
+            )
+
+    return W1, b1, W2, b2
+
+
+# =========================================================
+# METRICS
+# =========================================================
+
+def confusion_matrix_manual(
+    y_true,
+    y_pred,
+):
+
+    tn = np.sum(
+        (y_true == 0)
+        & (y_pred == 0)
+    )
+
+    fp = np.sum(
+        (y_true == 0)
+        & (y_pred == 1)
+    )
+
+    fn = np.sum(
+        (y_true == 1)
+        & (y_pred == 0)
+    )
+
+    tp = np.sum(
+        (y_true == 1)
+        & (y_pred == 1)
+    )
+
+    return np.array(
+        [
+            [tn, fp],
+            [fn, tp],
+        ],
+        dtype=np.int64,
+    )
+
+
+def binary_metrics(
+    y_true,
+    probabilities,
+):
+
+    predictions = (
+        probabilities >= 0.5
+    ).astype(int)
+
+    cm = confusion_matrix_manual(
+        y_true,
+        predictions,
+    )
+
+    tn, fp = cm[0]
+    fn, tp = cm[1]
+
+    total = (
+        tn + fp + fn + tp
+    )
+
+    accuracy = (
+        (tp + tn) / total
+        if total > 0
+        else 0.0
+    )
+
+    precision = (
+        tp / (tp + fp)
+        if (tp + fp) > 0
+        else 0.0
+    )
+
+    recall = (
+        tp / (tp + fn)
+        if (tp + fn) > 0
+        else 0.0
+    )
+
+    f1 = (
+        2.0
+        * precision
+        * recall
+        / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    return (
+        accuracy,
+        precision,
+        recall,
+        f1,
+        cm,
+        predictions,
+    )
+
+
+def roc_auc_manual(
+    y_true,
+    probabilities,
+):
+
+    positives = probabilities[
+        y_true == 1
+    ]
+
+    negatives = probabilities[
+        y_true == 0
+    ]
+
+    if (
+        len(positives) == 0
+        or len(negatives) == 0
+    ):
+        return 0.5
+
+    # Mann-Whitney formulation
+    combined = np.concatenate(
+        [
+            positives,
+            negatives,
+        ]
+    )
+
+    order = np.argsort(
+        combined
+    )
+
+    ranks = np.empty_like(
+        order,
+        dtype=np.float64,
+    )
+
+    ranks[order] = np.arange(
+        1,
+        len(combined) + 1,
+    )
+
+    positive_ranks = ranks[
+        :len(positives)
+    ]
+
+    auc = (
+        np.sum(
+            positive_ranks
+        )
+        - (
+            len(positives)
+            * (
+                len(positives)
+                + 1
+            )
+            / 2
+        )
+    ) / (
+        len(positives)
+        * len(negatives)
+    )
+
+    return float(auc)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
@@ -182,7 +749,7 @@ def main():
     args = parser.parse_args()
 
     # -----------------------------------------------------
-    # Load
+    # Load dataset
     # -----------------------------------------------------
 
     X, y, paths = load_dataset(
@@ -195,117 +762,105 @@ def main():
         )
 
     # -----------------------------------------------------
-    # Train/test split
-    #
-    # IMPORTANT:
-    # This is still a clip-level split.
-    # If your dataset has speaker IDs, we should
-    # replace this with GroupShuffleSplit.
+    # Split
     # -----------------------------------------------------
 
-    X_train, X_test, y_train, y_test = (
-        train_test_split(
-            X,
-            y,
-            test_size=0.20,
-            stratify=y,
-            random_state=42,
-        )
+    (
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    ) = train_test_split_manual(
+        X,
+        y,
+        test_size=0.20,
+        seed=RANDOM_SEED,
     )
 
     print()
     print(
-        f"Training samples: {len(X_train)}"
+        f"Training samples: "
+        f"{len(X_train)}"
     )
 
     print(
-        f"Test samples:     {len(X_test)}"
+        f"Test samples:     "
+        f"{len(X_test)}"
     )
 
     # -----------------------------------------------------
     # Standardization
     # -----------------------------------------------------
 
-    scaler = StandardScaler()
-
-    X_train_scaled = scaler.fit_transform(
+    mean, std = fit_scaler(
         X_train
     )
 
-    X_test_scaled = scaler.transform(
-        X_test
+    X_train_scaled = standardize(
+        X_train,
+        mean,
+        std,
+    )
+
+    X_test_scaled = standardize(
+        X_test,
+        mean,
+        std,
     )
 
     # -----------------------------------------------------
-    # Model
+    # Train
     # -----------------------------------------------------
 
-    clf = MLPClassifier(
-        hidden_layer_sizes=(12,),
-        activation="relu",
-        solver="adam",
-        alpha=1e-3,
-        max_iter=2000,
-        random_state=42,
-        early_stopping=True,
-        validation_fraction=0.15,
-        n_iter_no_change=30,
-        learning_rate_init=1e-3,
-    )
+    print()
+    print("=" * 60)
+    print("TRAINING NUMPY MLP")
+    print("=" * 60)
 
-    clf.fit(
+    W1, b1, W2, b2 = train_model(
         X_train_scaled,
         y_train,
+        input_dim=len(FEATURE_NAMES),
+        hidden_dim=HIDDEN_UNITS,
+        learning_rate=LEARNING_RATE,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        l2=L2,
+        seed=RANDOM_SEED,
     )
 
     # -----------------------------------------------------
-    # Predictions
+    # Test
     # -----------------------------------------------------
 
-    probabilities = clf.predict_proba(
-        X_test_scaled
-    )[:, 1]
+    _, _, probabilities = forward(
+        X_test_scaled,
+        W1,
+        b1,
+        W2,
+        b2,
+    )
 
-    predictions = (
-        probabilities >= 0.5
-    ).astype(int)
-
-    # -----------------------------------------------------
-    # Metrics
-    # -----------------------------------------------------
-
-    accuracy = accuracy_score(
-        y_test,
+    (
+        accuracy,
+        precision,
+        recall,
+        f1,
+        cm,
         predictions,
-    )
-
-    auc = roc_auc_score(
+    ) = binary_metrics(
         y_test,
         probabilities,
     )
 
-    precision = precision_score(
+    auc = roc_auc_manual(
         y_test,
-        predictions,
-        zero_division=0,
+        probabilities,
     )
 
-    recall = recall_score(
-        y_test,
-        predictions,
-        zero_division=0,
-    )
-
-    f1 = f1_score(
-        y_test,
-        predictions,
-        zero_division=0,
-    )
-
-    cm = confusion_matrix(
-        y_test,
-        predictions,
-    )
+    # -----------------------------------------------------
+    # Evaluation
+    # -----------------------------------------------------
 
     print()
     print("=" * 60)
@@ -337,25 +892,9 @@ def main():
     print(cm)
 
     print()
-    print(
-        classification_report(
-            y_test,
-            predictions,
-            target_names=[
-                "bonafide",
-                "spoof",
-            ],
-            zero_division=0,
-        )
-    )
-
-    # -----------------------------------------------------
-    # Detect suspicious perfect performance
-    # -----------------------------------------------------
 
     if accuracy >= 0.999 and auc >= 0.999:
 
-        print()
         print("⚠️ WARNING")
         print(
             "Accuracy and AUC are almost perfect."
@@ -366,46 +905,9 @@ def main():
             "or source-specific artifacts."
         )
 
-        print(
-            "Do NOT assume this means "
-            "real-world performance is perfect."
-        )
-
     # -----------------------------------------------------
-    # Export weights
+    # Export
     # -----------------------------------------------------
-
-    # sklearn:
-    #
-    # coefs_[0] = [45][12]
-    #
-    # JS expects:
-    #
-    # W1 = [12][45]
-    #
-
-    W1 = (
-        clf.coefs_[0]
-        .T
-        .tolist()
-    )
-
-    b1 = (
-        clf.intercepts_[0]
-        .tolist()
-    )
-
-    W2 = [
-        clf.coefs_[1]
-        .T[0]
-        .tolist()
-    ]
-
-    b2 = [
-        float(
-            clf.intercepts_[1][0]
-        )
-    ]
 
     output = {
 
@@ -413,22 +915,22 @@ def main():
             FEATURE_NAMES,
 
         "mean":
-            scaler.mean_.tolist(),
+            mean.tolist(),
 
         "std":
-            scaler.scale_.tolist(),
+            std.tolist(),
 
         "W1":
-            W1,
+            W1.tolist(),
 
         "b1":
-            b1,
+            b1.tolist(),
 
         "W2":
-            W2,
+            W2.tolist(),
 
         "b2":
-            b2,
+            b2.tolist(),
 
         "hiddenUnitNames": [
             f"h{i}"
@@ -438,7 +940,7 @@ def main():
         ],
 
         "version":
-            "trained-v2",
+            "trained-numpy-v3",
     }
 
     output_path = Path(
