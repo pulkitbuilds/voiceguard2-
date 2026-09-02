@@ -1,0 +1,8 @@
+{
+  "cache_version": "voiceguard-cache-v1",
+  "num_files": 53882,
+  "feature_dim": 45,
+  "target_sample_rate": 16000,
+  "valid_files": 53868,
+  "skipped_files": 14
+}

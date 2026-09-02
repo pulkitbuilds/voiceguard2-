@@ -1,11 +1,48 @@
-# scripts/train_classifier.py
+# ============================================================
+# VoiceGuard - Production-Oriented Audio Classifier
+#
+# Supports:
+#   - WAV
+#   - MP3
+#   - 40,000 - 100,000+ files
+#   - Streaming audio processing
+#   - Disk-backed feature cache using NumPy memmap
+#   - Low RAM usage
+#   - Correct label alignment
+#   - Stratified train/validation split
+#   - Class-weighted BCE
+#   - Early stopping
+#   - Checkpointing
+#   - Final JSON model export
+#
+# Expected dataset:
+#
+# data/
+# ├── bonafide/
+# │   ├── *.wav
+# │   └── *.mp3
+# │
+# └── spoof/
+#     ├── *.wav
+#     └── *.mp3
+#
+# ============================================================
 
 import argparse
+import gc
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.io import wavfile
+
+try:
+    import librosa
+except ImportError:
+    print("ERROR: librosa is not installed.")
+    print("Run:")
+    print("    pip install librosa soundfile")
+    sys.exit(1)
 
 from extract_features import (
     extract_features,
@@ -13,224 +50,1002 @@ from extract_features import (
 )
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
-HIDDEN_UNITS = 12
-LEARNING_RATE = 0.001
-EPOCHS = 300
-BATCH_SIZE = 64
-L2 = 1e-4
 RANDOM_SEED = 42
 
+TARGET_SAMPLE_RATE = 16000
 
-# =========================================================
-# WAV LOADING
-# =========================================================
+HIDDEN_UNITS = 16
 
-def load_wav(path):
+LEARNING_RATE = 0.001
 
-    sample_rate, audio = wavfile.read(path)
+EPOCHS = 50
 
-    audio = np.asarray(audio)
+BATCH_SIZE = 64
 
-    # Stereo -> mono
-    if audio.ndim == 2:
-        audio = np.mean(
-            audio.astype(np.float64),
-            axis=1,
+VALIDATION_SIZE = 0.20
+
+L2 = 1e-4
+
+EARLY_STOPPING_PATIENCE = 7
+
+MIN_DELTA = 1e-4
+
+CACHE_VERSION = "voiceguard-cache-v1"
+
+MODEL_VERSION = "trained-numpy-v5-production"
+
+SUPPORTED_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+}
+
+PRINT_EVERY_FILES = 500
+
+CHECKPOINT_EVERY = 1
+
+
+# ============================================================
+# AUDIO LOADING
+# ============================================================
+
+def load_audio(path):
+    """
+    Load WAV or MP3.
+
+    Output:
+        sample_rate = 16000
+        audio = mono float32
+    """
+
+    path = str(path)
+
+    try:
+        audio, sample_rate = librosa.load(
+            path,
+            sr=None,
+            mono=True,
+            dtype=np.float32,
         )
-    else:
-        audio = audio.astype(np.float64)
 
-    # Normalize PCM
-    if np.issubdtype(audio.dtype, np.integer):
-        info = np.iinfo(audio.dtype)
-
-        max_abs = np.maximum(
-            abs(info.min),
-            abs(info.max),
+    except Exception as e:
+        raise RuntimeError(
+            f"Audio decode failed: {e}"
         )
 
-        audio = audio / max_abs
+    if audio is None or len(audio) == 0:
+        raise ValueError(
+            "Audio is empty."
+        )
 
     audio = np.asarray(
         audio,
-        dtype=np.float64,
+        dtype=np.float32,
     )
 
-    return sample_rate, audio
+    audio = np.nan_to_num(
+        audio,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    sample_rate = int(sample_rate)
+
+    # --------------------------------------------------------
+    # Resample everything to 16 kHz
+    # --------------------------------------------------------
+
+    if sample_rate != TARGET_SAMPLE_RATE:
+
+        try:
+
+            audio = librosa.resample(
+                audio,
+                orig_sr=sample_rate,
+                target_sr=TARGET_SAMPLE_RATE,
+            )
+
+        except Exception as e:
+
+            raise RuntimeError(
+                f"Resampling failed: {e}"
+            )
+
+        sample_rate = TARGET_SAMPLE_RATE
+
+    return (
+        TARGET_SAMPLE_RATE,
+        np.asarray(
+            audio,
+            dtype=np.float32,
+        ),
+    )
 
 
-# =========================================================
-# DATASET LOADING
-# =========================================================
+# ============================================================
+# DATASET DISCOVERY
+# ============================================================
 
-def load_dataset(data_dir):
+def discover_dataset(data_dir):
 
-    data_dir = Path(data_dir)
+    data_dir = Path(
+        data_dir
+    )
+
+    if not data_dir.exists():
+        raise FileNotFoundError(
+            f"Dataset directory does not exist: "
+            f"{data_dir}"
+        )
 
     classes = [
         ("bonafide", 0),
         ("spoof", 1),
     ]
 
-    X = []
-    y = []
     paths = []
+    labels = []
+
+    format_counts = {
+        "bonafide": {
+            ".wav": 0,
+            ".mp3": 0,
+        },
+        "spoof": {
+            ".wav": 0,
+            ".mp3": 0,
+        },
+    }
+
+    print()
+    print("=" * 70)
+    print("DISCOVERING DATASET")
+    print("=" * 70)
 
     for folder, label in classes:
 
-        class_dir = data_dir / folder
+        class_dir = (
+            data_dir / folder
+        )
 
         if not class_dir.exists():
+
             raise FileNotFoundError(
-                f"Missing dataset folder: {class_dir}"
+                f"Missing dataset folder: "
+                f"{class_dir}"
             )
 
-        wav_files = sorted(
-            class_dir.rglob("*.wav")
+        class_files = []
+
+        for path in class_dir.rglob("*"):
+
+            if not path.is_file():
+                continue
+
+            extension = (
+                path.suffix.lower()
+            )
+
+            if extension in SUPPORTED_EXTENSIONS:
+
+                class_files.append(
+                    path
+                )
+
+                format_counts[
+                    folder
+                ][extension] += 1
+
+        class_files.sort()
+
+        print()
+        print(
+            f"{folder.upper()}"
         )
 
         print(
-            f"{folder}: {len(wav_files)} files"
+            f"  Total : {len(class_files)}"
         )
 
-        for index, wav_path in enumerate(wav_files):
+        print(
+            f"  WAV   : "
+            f"{format_counts[folder]['.wav']}"
+        )
 
-            try:
+        print(
+            f"  MP3   : "
+            f"{format_counts[folder]['.mp3']}"
+        )
 
-                sample_rate, audio = load_wav(
-                    wav_path
-                )
+        for path in class_files:
 
-                result = extract_features(
-                    audio,
-                    sample_rate,
-                )
+            paths.append(
+                str(path)
+            )
 
-                vector = np.asarray(
-                    result["vector"],
-                    dtype=np.float64,
-                )
+            labels.append(
+                label
+            )
 
-                if len(vector) != len(FEATURE_NAMES):
-                    raise ValueError(
-                        f"Expected "
-                        f"{len(FEATURE_NAMES)} "
-                        f"features, got "
-                        f"{len(vector)}"
-                    )
+    if len(paths) == 0:
 
-                X.append(vector)
-                y.append(label)
-                paths.append(str(wav_path))
+        raise RuntimeError(
+            "No WAV or MP3 files found."
+        )
 
-                # Progress every 100 files
-                if (index + 1) % 100 == 0:
-                    print(
-                        f"  {index + 1}/"
-                        f"{len(wav_files)}"
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"Skipping {wav_path}: {e}"
-                )
-
-    X = np.asarray(
-        X,
-        dtype=np.float64,
+    paths = np.asarray(
+        paths,
+        dtype=object,
     )
 
-    y = np.asarray(
-        y,
+    labels = np.asarray(
+        labels,
         dtype=np.int64,
     )
 
     print()
+    print("-" * 70)
+
     print(
-        f"Loaded {len(X)} clips "
-        f"({np.sum(y == 0)} bonafide / "
-        f"{np.sum(y == 1)} spoof)"
+        f"TOTAL FILES: {len(paths):,}"
     )
 
-    return X, y, paths
+    print(
+        f"BONAFIDE:   "
+        f"{np.sum(labels == 0):,}"
+    )
+
+    print(
+        f"SPOOF:      "
+        f"{np.sum(labels == 1):,}"
+    )
+
+    print()
+    print("Format distribution:")
+
+    print(
+        f"  Bonafide WAV : "
+        f"{format_counts['bonafide']['.wav']:,}"
+    )
+
+    print(
+        f"  Bonafide MP3 : "
+        f"{format_counts['bonafide']['.mp3']:,}"
+    )
+
+    print(
+        f"  Spoof WAV    : "
+        f"{format_counts['spoof']['.wav']:,}"
+    )
+
+    print(
+        f"  Spoof MP3    : "
+        f"{format_counts['spoof']['.mp3']:,}"
+    )
+
+    print("-" * 70)
+
+    return paths, labels
 
 
-# =========================================================
-# TRAIN / TEST SPLIT
-# =========================================================
+# ============================================================
+# STRATIFIED SPLIT
+# ============================================================
 
-def train_test_split_manual(
-    X,
-    y,
-    test_size=0.20,
-    seed=42,
+def stratified_split(
+    paths,
+    labels,
+    validation_size=VALIDATION_SIZE,
+    seed=RANDOM_SEED,
 ):
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(
+        seed
+    )
 
     train_indices = []
-    test_indices = []
+    validation_indices = []
 
     for label in [0, 1]:
 
-        indices = np.where(y == label)[0]
+        class_indices = np.where(
+            labels == label
+        )[0]
 
-        rng.shuffle(indices)
+        if len(class_indices) < 2:
 
-        n_test = max(
-            1,
-            int(len(indices) * test_size)
+            raise RuntimeError(
+                f"Not enough samples for class "
+                f"{label}."
+            )
+
+        rng.shuffle(
+            class_indices
         )
 
-        test_indices.extend(
-            indices[:n_test]
+        n_validation = max(
+            1,
+            int(
+                len(class_indices)
+                * validation_size
+            ),
+        )
+
+        validation_indices.extend(
+            class_indices[
+                :n_validation
+            ]
         )
 
         train_indices.extend(
-            indices[n_test:]
+            class_indices[
+                n_validation:
+            ]
         )
 
-    rng.shuffle(train_indices)
-    rng.shuffle(test_indices)
+    train_indices = np.asarray(
+        train_indices,
+        dtype=np.int64,
+    )
+
+    validation_indices = np.asarray(
+        validation_indices,
+        dtype=np.int64,
+    )
+
+    rng.shuffle(
+        train_indices
+    )
+
+    rng.shuffle(
+        validation_indices
+    )
 
     return (
-        X[train_indices],
-        X[test_indices],
-        y[train_indices],
-        y[test_indices],
+        train_indices,
+        validation_indices,
     )
 
 
-# =========================================================
-# STANDARDIZATION
-# =========================================================
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
 
-def fit_scaler(X):
+def extract_feature_vector(path):
 
-    mean = np.mean(
-        X,
-        axis=0,
+    sample_rate, audio = (
+        load_audio(path)
     )
 
-    std = np.std(
-        X,
-        axis=0,
+    result = extract_features(
+        audio,
+        sample_rate,
     )
 
-    # Prevent division by zero
-    std = np.where(
-        std < 1e-8,
-        1.0,
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        raise ValueError(
+            "extract_features() "
+            "did not return a dictionary."
+        )
+
+    if "vector" not in result:
+
+        raise ValueError(
+            "Feature result does not contain "
+            "'vector'."
+        )
+
+    vector = np.asarray(
+        result["vector"],
+        dtype=np.float32,
+    )
+
+    vector = vector.reshape(
+        -1
+    )
+
+    expected = len(
+        FEATURE_NAMES
+    )
+
+    if len(vector) != expected:
+
+        raise ValueError(
+            f"Expected {expected} features, "
+            f"got {len(vector)}."
+        )
+
+    if not np.all(
+        np.isfinite(vector)
+    ):
+
+        raise ValueError(
+            "Feature vector contains "
+            "NaN or Inf."
+        )
+
+    return vector
+
+
+# ============================================================
+# CACHE PATHS
+# ============================================================
+
+def cache_paths(cache_dir):
+
+    cache_dir = Path(
+        cache_dir
+    )
+
+    return {
+        "features":
+            cache_dir / "features.dat",
+
+        "labels":
+            cache_dir / "labels.npy",
+
+        "paths":
+            cache_dir / "paths.json",
+
+        "valid":
+            cache_dir / "valid.npy",
+
+        "metadata":
+            cache_dir / "metadata.json",
+    }
+
+
+# ============================================================
+# CREATE FEATURE CACHE
+# ============================================================
+
+def build_feature_cache(
+    paths,
+    labels,
+    cache_dir,
+    feature_dim,
+):
+
+    cache_dir = Path(
+        cache_dir
+    )
+
+    cache_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    files = cache_paths(
+        cache_dir
+    )
+
+    n_files = len(paths)
+
+    # --------------------------------------------------------
+    # Check existing cache
+    # --------------------------------------------------------
+
+    if (
+        files["metadata"].exists()
+        and files["features"].exists()
+        and files["labels"].exists()
+        and files["valid"].exists()
+        and files["paths"].exists()
+    ):
+
+        try:
+
+            with open(
+                files["metadata"],
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                metadata = json.load(f)
+
+            if (
+                metadata.get(
+                    "cache_version"
+                )
+                == CACHE_VERSION
+                and metadata.get(
+                    "num_files"
+                )
+                == n_files
+                and metadata.get(
+                    "feature_dim"
+                )
+                == feature_dim
+                and metadata.get(
+                    "target_sample_rate"
+                )
+                == TARGET_SAMPLE_RATE
+            ):
+
+                cached_paths = np.asarray(
+                    json.loads(
+                        files["paths"].read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                    dtype=object,
+                )
+
+                cached_labels = np.load(
+                    files["labels"]
+                )
+
+                if (
+                    len(cached_paths)
+                    == len(paths)
+                    and np.array_equal(
+                        cached_labels,
+                        labels,
+                    )
+                    and np.array_equal(
+                        cached_paths,
+                        paths,
+                    )
+                ):
+
+                    print()
+                    print("=" * 70)
+                    print("FEATURE CACHE")
+                    print("=" * 70)
+
+                    print(
+                        "Existing compatible "
+                        "cache found."
+                    )
+
+                    print(
+                        f"Cache: {cache_dir}"
+                    )
+
+                    return files
+
+        except Exception as e:
+
+            print(
+                "Existing cache could not "
+                f"be reused: {e}"
+            )
+
+    # --------------------------------------------------------
+    # Create new cache
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("BUILDING FEATURE CACHE")
+    print("=" * 70)
+
+    print(
+        f"Files:        {n_files:,}"
+    )
+
+    print(
+        f"Feature dim:  {feature_dim}"
+    )
+
+    print(
+        f"Cache:        {cache_dir}"
+    )
+
+    print()
+    print(
+        "Audio will be decoded only once."
+    )
+
+    print(
+        "Features are stored on disk, "
+        "not kept in RAM."
+    )
+
+    # --------------------------------------------------------
+    # Disk-backed feature matrix
+    #
+    # We allocate one row per discovered file.
+    # Failed files are marked invalid.
+    # --------------------------------------------------------
+
+    feature_memmap = np.memmap(
+        files["features"],
+        dtype=np.float32,
+        mode="w+",
+        shape=(
+            n_files,
+            feature_dim,
+        ),
+    )
+
+    valid = np.zeros(
+        n_files,
+        dtype=np.bool_,
+    )
+
+    skipped = 0
+
+    for index in range(
+        n_files
+    ):
+
+        path = paths[index]
+
+        try:
+
+            vector = (
+                extract_feature_vector(
+                    path
+                )
+            )
+
+            feature_memmap[
+                index
+            ] = vector
+
+            valid[index] = True
+
+        except Exception as e:
+
+            skipped += 1
+
+            print()
+            print(
+                f"[SKIP {index + 1:,}/{n_files:,}]"
+            )
+
+            print(
+                f"  {path}"
+            )
+
+            print(
+                f"  Reason: {e}"
+            )
+
+            # Keep zero row.
+            # `valid=False` means it will NEVER
+            # be used for training/evaluation.
+
+        if (
+            (index + 1)
+            % PRINT_EVERY_FILES
+            == 0
+            or index == n_files - 1
+        ):
+
+            valid_count = int(
+                np.sum(valid)
+            )
+
+            print(
+                f"Cache: "
+                f"{index + 1:,}/{n_files:,} | "
+                f"Valid: {valid_count:,} | "
+                f"Skipped: {skipped:,}"
+            )
+
+            # Flush periodically so a crash does
+            # not leave a completely unflushed cache.
+            feature_memmap.flush()
+
+    feature_memmap.flush()
+
+    del feature_memmap
+
+    gc.collect()
+
+    # --------------------------------------------------------
+    # Save metadata
+    # --------------------------------------------------------
+
+    np.save(
+        files["labels"],
+        labels,
+    )
+
+    np.save(
+        files["valid"],
+        valid,
+    )
+
+    with open(
+        files["paths"],
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            paths.tolist(),
+            f,
+        )
+
+    metadata = {
+        "cache_version":
+            CACHE_VERSION,
+
+        "num_files":
+            int(n_files),
+
+        "feature_dim":
+            int(feature_dim),
+
+        "target_sample_rate":
+            int(TARGET_SAMPLE_RATE),
+
+        "valid_files":
+            int(np.sum(valid)),
+
+        "skipped_files":
+            int(skipped),
+    }
+
+    with open(
+        files["metadata"],
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=2,
+        )
+
+    print()
+    print(
+        f"Valid files: "
+        f"{np.sum(valid):,}"
+    )
+
+    print(
+        f"Skipped files: "
+        f"{skipped:,}"
+    )
+
+    return files
+
+
+# ============================================================
+# OPEN FEATURE CACHE
+# ============================================================
+
+def open_feature_cache(
+    cache_dir,
+    num_files,
+    feature_dim,
+):
+
+    files = cache_paths(
+        Path(cache_dir)
+    )
+
+    features = np.memmap(
+        files["features"],
+        dtype=np.float32,
+        mode="r",
+        shape=(
+            num_files,
+            feature_dim,
+        ),
+    )
+
+    labels = np.load(
+        files["labels"],
+        mmap_mode="r",
+    )
+
+    valid = np.load(
+        files["valid"],
+        mmap_mode="r",
+    )
+
+    return (
+        features,
+        labels,
+        valid,
+    )
+
+
+# ============================================================
+# STREAMING SCALER FROM MEMMAP
+# ============================================================
+
+def fit_scaler(
+    features,
+    train_indices,
+    valid_mask,
+    batch_size,
+):
+
+    feature_dim = (
+        features.shape[1]
+    )
+
+    count = 0
+
+    mean = np.zeros(
+        feature_dim,
+        dtype=np.float64,
+    )
+
+    M2 = np.zeros(
+        feature_dim,
+        dtype=np.float64,
+    )
+
+    print()
+    print("=" * 70)
+    print("FITTING TRAINING SCALER")
+    print("=" * 70)
+
+    # We process indices in batches.
+    # Only a small feature matrix is loaded at a time.
+
+    valid_train_indices = (
+        train_indices[
+            np.asarray(
+                valid_mask[
+                    train_indices
+                ],
+                dtype=bool,
+            )
+        ]
+    )
+
+    total = len(
+        valid_train_indices
+    )
+
+    if total == 0:
+
+        raise RuntimeError(
+            "No valid training features."
+        )
+
+    for start in range(
+        0,
+        total,
+        batch_size,
+    ):
+
+        end = min(
+            start + batch_size,
+            total,
+        )
+
+        batch_indices = (
+            valid_train_indices[
+                start:end
+            ]
+        )
+
+        X = np.asarray(
+            features[
+                batch_indices
+            ],
+            dtype=np.float32,
+        )
+
+        X64 = X.astype(
+            np.float64
+        )
+
+        batch_count = (
+            len(X64)
+        )
+
+        batch_mean = np.mean(
+            X64,
+            axis=0,
+        )
+
+        centered = (
+            X64 - batch_mean
+        )
+
+        batch_M2 = np.sum(
+            centered * centered,
+            axis=0,
+        )
+
+        if count == 0:
+
+            count = batch_count
+            mean = batch_mean
+            M2 = batch_M2
+
+        else:
+
+            total_count = (
+                count + batch_count
+            )
+
+            delta = (
+                batch_mean - mean
+            )
+
+            mean = (
+                mean
+                + delta
+                * (
+                    batch_count
+                    / total_count
+                )
+            )
+
+            M2 = (
+                M2
+                + batch_M2
+                + (
+                    delta
+                    * delta
+                    * count
+                    * batch_count
+                    / total_count
+                )
+            )
+
+            count = total_count
+
+        if (
+            end % (
+                batch_size * 100
+            ) == 0
+            or end == total
+        ):
+
+            print(
+                f"Scaler: "
+                f"{end:,}/{total:,}"
+            )
+
+        del X
+        del X64
+
+    variance = (
+        M2
+        / max(
+            count - 1,
+            1,
+        )
+    )
+
+    std = np.sqrt(
+        np.maximum(
+            variance,
+            1e-8,
+        )
+    )
+
+    mean = np.asarray(
+        mean,
+        dtype=np.float32,
+    )
+
+    std = np.asarray(
         std,
+        dtype=np.float32,
     )
 
-    return mean, std
+    return (
+        mean,
+        std,
+        total,
+    )
 
+
+# ============================================================
+# STANDARDIZE
+# ============================================================
 
 def standardize(
     X,
@@ -239,98 +1054,108 @@ def standardize(
 ):
 
     return (
-        X - mean
-    ) / std
+        (
+            X - mean
+        )
+        / std
+    ).astype(
+        np.float32,
+        copy=False,
+    )
 
 
-# =========================================================
-# ACTIVATION
-# =========================================================
+# ============================================================
+# ACTIVATIONS
+# ============================================================
 
 def relu(x):
 
     return np.maximum(
-        0.0,
         x,
+        0.0,
     )
-
-
-def relu_derivative(x):
-
-    return (
-        x > 0
-    ).astype(np.float64)
 
 
 def sigmoid(x):
 
-    # Stable sigmoid
     x = np.clip(
         x,
         -50.0,
         50.0,
     )
 
-    return 1.0 / (
-        1.0 + np.exp(-x)
+    return (
+        1.0
+        / (
+            1.0
+            + np.exp(-x)
+        )
+    ).astype(
+        np.float32
     )
 
 
-# =========================================================
+# ============================================================
 # MODEL INITIALIZATION
-# =========================================================
+# ============================================================
 
 def initialize_model(
     input_dim,
     hidden_dim,
-    seed=42,
+    seed,
 ):
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(
+        seed
+    )
 
-    # He initialization
-    W1 = (
-        rng.normal(
-            0.0,
-            np.sqrt(
-                2.0 / input_dim
-            ),
-            size=(
-                hidden_dim,
-                input_dim,
-            ),
-        )
+    W1 = rng.normal(
+        0.0,
+        np.sqrt(
+            2.0 / input_dim
+        ),
+        size=(
+            hidden_dim,
+            input_dim,
+        ),
+    ).astype(
+        np.float32
     )
 
     b1 = np.zeros(
         hidden_dim,
-        dtype=np.float64,
+        dtype=np.float32,
     )
 
-    W2 = (
-        rng.normal(
-            0.0,
-            np.sqrt(
-                2.0 / hidden_dim
-            ),
-            size=(
-                1,
-                hidden_dim,
-            ),
-        )
+    W2 = rng.normal(
+        0.0,
+        np.sqrt(
+            2.0 / hidden_dim
+        ),
+        size=(
+            1,
+            hidden_dim,
+        ),
+    ).astype(
+        np.float32
     )
 
     b2 = np.zeros(
         1,
-        dtype=np.float64,
+        dtype=np.float32,
     )
 
-    return W1, b1, W2, b2
+    return (
+        W1,
+        b1,
+        W2,
+        b2,
+    )
 
 
-# =========================================================
-# FORWARD PASS
-# =========================================================
+# ============================================================
+# FORWARD
+# ============================================================
 
 def forward(
     X,
@@ -344,7 +1169,9 @@ def forward(
         X @ W1.T
     ) + b1
 
-    a1 = relu(z1)
+    a1 = relu(
+        z1
+    )
 
     z2 = (
         a1 @ W2.T
@@ -361,286 +1188,851 @@ def forward(
     )
 
 
-# =========================================================
-# TRAINING
-# =========================================================
+# ============================================================
+# TRAIN ONE BATCH
+# ============================================================
 
-def train_model(
+def train_batch(
     X,
     y,
-    input_dim,
-    hidden_dim=12,
-    learning_rate=0.001,
-    epochs=300,
-    batch_size=64,
-    l2=1e-4,
-    seed=42,
+    W1,
+    b1,
+    W2,
+    b2,
+    learning_rate,
+    l2,
+    positive_weight,
+    negative_weight,
 ):
 
-    rng = np.random.default_rng(seed)
+    batch_n = len(X)
 
-    W1, b1, W2, b2 = initialize_model(
-        input_dim,
-        hidden_dim,
-        seed,
+    (
+        z1,
+        a1,
+        probabilities,
+    ) = forward(
+        X,
+        W1,
+        b1,
+        W2,
+        b2,
     )
 
-    n_samples = len(X)
+    # --------------------------------------------------------
+    # Class weighting
+    # --------------------------------------------------------
 
-    for epoch in range(epochs):
+    sample_weights = np.where(
+        y == 1,
+        positive_weight,
+        negative_weight,
+    ).astype(
+        np.float32
+    )
 
-        indices = np.arange(
-            n_samples
+    weight_sum = np.sum(
+        sample_weights
+    )
+
+    p = np.clip(
+        probabilities,
+        1e-7,
+        1.0 - 1e-7,
+    )
+
+    per_sample_loss = -(
+        y * np.log(p)
+        + (
+            1.0 - y
+        )
+        * np.log(
+            1.0 - p
+        )
+    )
+
+    loss = (
+        np.sum(
+            per_sample_loss
+            * sample_weights
+        )
+        / weight_sum
+    )
+
+    # L2
+    loss += (
+        l2
+        * (
+            np.sum(W1 * W1)
+            + np.sum(W2 * W2)
+        )
+        / 2.0
+    )
+
+    # --------------------------------------------------------
+    # Backprop
+    # --------------------------------------------------------
+
+    dz2 = (
+        (
+            probabilities
+            - y
+        )
+        * sample_weights
+        / weight_sum
+    ).reshape(
+        -1,
+        1,
+    )
+
+    dW2 = (
+        dz2.T @ a1
+    )
+
+    db2 = np.sum(
+        dz2,
+        axis=0,
+    )
+
+    da1 = (
+        dz2 @ W2
+    )
+
+    dz1 = (
+        da1
+        * (
+            z1 > 0
+        ).astype(
+            np.float32
+        )
+    )
+
+    dW1 = (
+        dz1.T @ X
+    )
+
+    db1 = np.sum(
+        dz1,
+        axis=0,
+    )
+
+    # L2
+    dW1 += (
+        l2 * W1
+    )
+
+    dW2 += (
+        l2 * W2
+    )
+
+    # --------------------------------------------------------
+    # Update
+    # --------------------------------------------------------
+
+    W1 -= (
+        learning_rate
+        * dW1
+    )
+
+    b1 -= (
+        learning_rate
+        * db1
+    )
+
+    W2 -= (
+        learning_rate
+        * dW2
+    )
+
+    b2 -= (
+        learning_rate
+        * db2
+    )
+
+    predictions = (
+        probabilities >= 0.5
+    ).astype(
+        np.int64
+    )
+
+    correct = int(
+        np.sum(
+            predictions == y
+        )
+    )
+
+    return (
+        float(loss),
+        correct,
+        batch_n,
+    )
+
+
+# ============================================================
+# CLASS WEIGHTS
+# ============================================================
+
+def calculate_class_weights(
+    labels,
+    train_indices,
+    valid_mask,
+):
+
+    usable = train_indices[
+        np.asarray(
+            valid_mask[
+                train_indices
+            ],
+            dtype=bool,
+        )
+    ]
+
+    y = np.asarray(
+        labels[usable],
+        dtype=np.int64,
+    )
+
+    negatives = np.sum(
+        y == 0
+    )
+
+    positives = np.sum(
+        y == 1
+    )
+
+    if (
+        negatives == 0
+        or positives == 0
+    ):
+
+        raise RuntimeError(
+            "Training set must contain "
+            "both bonafide and spoof samples."
         )
 
-        rng.shuffle(indices)
+    total = (
+        negatives
+        + positives
+    )
 
-        X_shuffled = X[indices]
-        y_shuffled = y[indices]
+    # Balanced class weights
+    negative_weight = (
+        total
+        / (
+            2.0
+            * negatives
+        )
+    )
+
+    positive_weight = (
+        total
+        / (
+            2.0
+            * positives
+        )
+    )
+
+    print()
+    print(
+        "Class weights:"
+    )
+
+    print(
+        f"  Bonafide: "
+        f"{negative_weight:.4f}"
+    )
+
+    print(
+        f"  Spoof:    "
+        f"{positive_weight:.4f}"
+    )
+
+    return (
+        float(positive_weight),
+        float(negative_weight),
+    )
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train_model(
+    features,
+    labels,
+    valid_mask,
+    train_indices,
+    validation_indices,
+    mean,
+    std,
+    hidden_units,
+    learning_rate,
+    epochs,
+    batch_size,
+    l2,
+    seed,
+    checkpoint_path,
+):
+
+    (
+        W1,
+        b1,
+        W2,
+        b2,
+    ) = initialize_model(
+        input_dim=len(
+            FEATURE_NAMES
+        ),
+        hidden_dim=hidden_units,
+        seed=seed,
+    )
+
+    (
+        positive_weight,
+        negative_weight,
+    ) = calculate_class_weights(
+        labels,
+        train_indices,
+        valid_mask,
+    )
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    # --------------------------------------------------------
+    # Only valid indices participate.
+    # --------------------------------------------------------
+
+    train_indices = train_indices[
+        np.asarray(
+            valid_mask[
+                train_indices
+            ],
+            dtype=bool,
+        )
+    ]
+
+    validation_indices = (
+        validation_indices[
+            np.asarray(
+                valid_mask[
+                    validation_indices
+                ],
+                dtype=bool,
+            )
+        ]
+    )
+
+    print()
+    print(
+        f"Valid training files: "
+        f"{len(train_indices):,}"
+    )
+
+    print(
+        f"Valid validation files: "
+        f"{len(validation_indices):,}"
+    )
+
+    best_validation_loss = (
+        float("inf")
+    )
+
+    best_weights = None
+
+    epochs_without_improvement = 0
+
+    # --------------------------------------------------------
+    # Training
+    # --------------------------------------------------------
+
+    for epoch in range(
+        1,
+        epochs + 1,
+    ):
+
+        shuffled = (
+            train_indices.copy()
+        )
+
+        rng.shuffle(
+            shuffled
+        )
 
         epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_samples = 0
+
+        # ----------------------------------------------------
+        # TRAINING BATCHES
+        # ----------------------------------------------------
 
         for start in range(
             0,
-            n_samples,
+            len(shuffled),
             batch_size,
         ):
 
             end = min(
                 start + batch_size,
-                n_samples,
+                len(shuffled),
             )
 
-            xb = X_shuffled[
-                start:end
-            ]
+            batch_indices = (
+                shuffled[
+                    start:end
+                ]
+            )
 
-            yb = y_shuffled[
-                start:end
-            ]
+            X = np.asarray(
+                features[
+                    batch_indices
+                ],
+                dtype=np.float32,
+            )
 
-            batch_n = len(xb)
+            y = np.asarray(
+                labels[
+                    batch_indices
+                ],
+                dtype=np.float32,
+            )
 
-            # -------------------------------------------------
-            # Forward
-            # -------------------------------------------------
+            X = standardize(
+                X,
+                mean,
+                std,
+            )
 
-            z1, a1, probabilities = forward(
-                xb,
+            (
+                batch_loss,
+                batch_correct,
+                batch_count,
+            ) = train_batch(
+                X,
+                y,
                 W1,
                 b1,
                 W2,
                 b2,
-            )
-
-            # -------------------------------------------------
-            # Binary cross entropy
-            # -------------------------------------------------
-
-            p = np.clip(
-                probabilities,
-                1e-7,
-                1.0 - 1e-7,
-            )
-
-            loss = -np.mean(
-                yb * np.log(p)
-                + (
-                    1.0 - yb
-                ) * np.log(
-                    1.0 - p
-                )
-            )
-
-            # L2 regularization
-            loss += (
-                l2
-                * (
-                    np.sum(W1 * W1)
-                    + np.sum(W2 * W2)
-                )
-                / 2.0
+                learning_rate,
+                l2,
+                positive_weight,
+                negative_weight,
             )
 
             epoch_loss += (
-                loss * batch_n
+                batch_loss
+                * batch_count
             )
 
-            # -------------------------------------------------
-            # Backpropagation
-            # -------------------------------------------------
+            epoch_correct += (
+                batch_correct
+            )
 
-            dz2 = (
-                probabilities - yb
-            ).reshape(
-                -1,
+            epoch_samples += (
+                batch_count
+            )
+
+            del X
+            del y
+
+        epoch_loss /= max(
+            epoch_samples,
+            1,
+        )
+
+        train_accuracy = (
+            epoch_correct
+            / max(
+                epoch_samples,
                 1,
             )
+        )
 
-            dW2 = (
-                dz2.T @ a1
-            ) / batch_n
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
 
-            db2 = np.mean(
-                dz2,
-                axis=0,
-            )
+        (
+            validation_loss,
+            validation_accuracy,
+            validation_metrics,
+        ) = evaluate_memmap(
+            features,
+            labels,
+            validation_indices,
+            mean,
+            std,
+            W1,
+            b1,
+            W2,
+            b2,
+            batch_size,
+            positive_weight,
+            negative_weight,
+        )
 
-            da1 = (
-                dz2 @ W2
-            )
+        print()
+        print(
+            f"Epoch {epoch:3d}/{epochs} | "
+            f"Loss {epoch_loss:.6f} | "
+            f"Train Acc {train_accuracy:.4f} | "
+            f"Val Loss {validation_loss:.6f} | "
+            f"Val Acc {validation_accuracy:.4f} | "
+            f"Val F1 {validation_metrics['f1']:.4f} | "
+            f"Val AUC {validation_metrics['auc']:.4f}"
+        )
 
-            dz1 = (
-                da1
-                * relu_derivative(z1)
-            )
+        # ----------------------------------------------------
+        # Early stopping
+        # ----------------------------------------------------
 
-            dW1 = (
-                dz1.T @ xb
-            ) / batch_n
-
-            db1 = np.mean(
-                dz1,
-                axis=0,
-            )
-
-            # L2
-            dW1 += l2 * W1
-            dW2 += l2 * W2
-
-            # -------------------------------------------------
-            # Gradient update
-            # -------------------------------------------------
-
-            W1 -= (
-                learning_rate
-                * dW1
-            )
-
-            b1 -= (
-                learning_rate
-                * db1
-            )
-
-            W2 -= (
-                learning_rate
-                * dW2
-            )
-
-            b2 -= (
-                learning_rate
-                * db2
-            )
-
-        epoch_loss /= n_samples
-
-        # Print progress
         if (
-            epoch == 0
-            or (epoch + 1) % 10 == 0
+            validation_loss
+            < (
+                best_validation_loss
+                - MIN_DELTA
+            )
         ):
 
-            _, _, train_prob = forward(
-                X,
+            best_validation_loss = (
+                validation_loss
+            )
+
+            best_weights = (
+                W1.copy(),
+                b1.copy(),
+                W2.copy(),
+                b2.copy(),
+            )
+
+            epochs_without_improvement = 0
+
+            print(
+                "  ✓ New best validation model"
+            )
+
+        else:
+
+            epochs_without_improvement += 1
+
+            print(
+                f"  No improvement: "
+                f"{epochs_without_improvement}/"
+                f"{EARLY_STOPPING_PATIENCE}"
+            )
+
+        # ----------------------------------------------------
+        # Checkpoint
+        # ----------------------------------------------------
+
+        if (
+            checkpoint_path
+            and (
+                epoch
+                % CHECKPOINT_EVERY
+                == 0
+            )
+        ):
+
+            save_checkpoint(
+                checkpoint_path,
                 W1,
                 b1,
                 W2,
                 b2,
+                mean,
+                std,
+                epoch,
+                best_validation_loss,
             )
 
-            train_pred = (
-                train_prob >= 0.5
-            ).astype(int)
+        if (
+            epochs_without_improvement
+            >= EARLY_STOPPING_PATIENCE
+        ):
 
-            train_acc = np.mean(
-                train_pred == y
-            )
-
+            print()
             print(
-                f"Epoch {epoch + 1:3d}/"
-                f"{epochs} | "
-                f"Loss: {epoch_loss:.6f} | "
-                f"Train Acc: "
-                f"{train_acc:.4f}"
+                "Early stopping triggered."
             )
 
-    return W1, b1, W2, b2
+            break
+
+    # --------------------------------------------------------
+    # Restore best model
+    # --------------------------------------------------------
+
+    if best_weights is not None:
+
+        (
+            W1,
+            b1,
+            W2,
+            b2,
+        ) = best_weights
+
+        print()
+        print(
+            "✓ Restored best validation model."
+        )
+
+    return (
+        W1,
+        b1,
+        W2,
+        b2,
+    )
 
 
-# =========================================================
-# METRICS
-# =========================================================
+# ============================================================
+# EVALUATION
+# ============================================================
 
-def confusion_matrix_manual(
-    y_true,
-    y_pred,
+def evaluate_memmap(
+    features,
+    labels,
+    indices,
+    mean,
+    std,
+    W1,
+    b1,
+    W2,
+    b2,
+    batch_size,
+    positive_weight,
+    negative_weight,
 ):
 
-    tn = np.sum(
-        (y_true == 0)
-        & (y_pred == 0)
-    )
+    total_loss = 0.0
+    total_count = 0
 
-    fp = np.sum(
-        (y_true == 0)
-        & (y_pred == 1)
-    )
+    all_true = []
+    all_probabilities = []
 
-    fn = np.sum(
-        (y_true == 1)
-        & (y_pred == 0)
-    )
+    for start in range(
+        0,
+        len(indices),
+        batch_size,
+    ):
 
-    tp = np.sum(
-        (y_true == 1)
-        & (y_pred == 1)
-    )
+        end = min(
+            start + batch_size,
+            len(indices),
+        )
 
-    return np.array(
-        [
-            [tn, fp],
-            [fn, tp],
-        ],
+        batch_indices = (
+            indices[
+                start:end
+            ]
+        )
+
+        X = np.asarray(
+            features[
+                batch_indices
+            ],
+            dtype=np.float32,
+        )
+
+        y = np.asarray(
+            labels[
+                batch_indices
+            ],
+            dtype=np.float32,
+        )
+
+        X = standardize(
+            X,
+            mean,
+            std,
+        )
+
+        (
+            _,
+            _,
+            probabilities,
+        ) = forward(
+            X,
+            W1,
+            b1,
+            W2,
+            b2,
+        )
+
+        sample_weights = np.where(
+            y == 1,
+            positive_weight,
+            negative_weight,
+        ).astype(
+            np.float32
+        )
+
+        weight_sum = np.sum(
+            sample_weights
+        )
+
+        p = np.clip(
+            probabilities,
+            1e-7,
+            1.0 - 1e-7,
+        )
+
+        loss = -np.sum(
+            (
+                y * np.log(p)
+                + (
+                    1.0 - y
+                )
+                * np.log(
+                    1.0 - p
+                )
+            )
+            * sample_weights
+        ) / weight_sum
+
+        total_loss += (
+            float(loss)
+            * len(y)
+        )
+
+        total_count += len(y)
+
+        all_true.extend(
+            y.astype(
+                np.int64
+            ).tolist()
+        )
+
+        all_probabilities.extend(
+            probabilities.tolist()
+        )
+
+        del X
+        del y
+
+    if total_count == 0:
+
+        return (
+            0.0,
+            0.0,
+            {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "auc": 0.0,
+            },
+        )
+
+    y_true = np.asarray(
+        all_true,
         dtype=np.int64,
     )
 
-
-def binary_metrics(
-    y_true,
-    probabilities,
-):
+    probabilities = np.asarray(
+        all_probabilities,
+        dtype=np.float32,
+    )
 
     predictions = (
         probabilities >= 0.5
-    ).astype(int)
+    ).astype(
+        np.int64
+    )
 
-    cm = confusion_matrix_manual(
+    accuracy = float(
+        np.mean(
+            predictions
+            == y_true
+        )
+    )
+
+    (
+        precision,
+        recall,
+        f1,
+    ) = calculate_precision_recall_f1(
         y_true,
         predictions,
     )
 
-    tn, fp = cm[0]
-    fn, tp = cm[1]
-
-    total = (
-        tn + fp + fn + tp
+    auc = roc_auc_manual(
+        y_true,
+        probabilities,
     )
 
-    accuracy = (
-        (tp + tn) / total
-        if total > 0
-        else 0.0
+    return (
+        float(
+            total_loss
+            / total_count
+        ),
+        accuracy,
+        {
+            "precision":
+                precision,
+
+            "recall":
+                recall,
+
+            "f1":
+                f1,
+
+            "auc":
+                auc,
+        },
+    )
+
+
+# ============================================================
+# PRECISION / RECALL / F1
+# ============================================================
+
+def calculate_precision_recall_f1(
+    y_true,
+    predictions,
+):
+
+    tp = np.sum(
+        (
+            y_true == 1
+        )
+        & (
+            predictions == 1
+        )
+    )
+
+    fp = np.sum(
+        (
+            y_true == 0
+        )
+        & (
+            predictions == 1
+        )
+    )
+
+    fn = np.sum(
+        (
+            y_true == 1
+        )
+        & (
+            predictions == 0
+        )
     )
 
     precision = (
         tp / (tp + fp)
-        if (tp + fp) > 0
+        if (
+            tp + fp
+        ) > 0
         else 0.0
     )
 
     recall = (
         tp / (tp + fn)
-        if (tp + fn) > 0
+        if (
+            tp + fn
+        ) > 0
         else 0.0
     )
 
@@ -648,20 +2040,27 @@ def binary_metrics(
         2.0
         * precision
         * recall
-        / (precision + recall)
-        if (precision + recall) > 0
+        / (
+            precision
+            + recall
+        )
+        if (
+            precision
+            + recall
+        ) > 0
         else 0.0
     )
 
     return (
-        accuracy,
-        precision,
-        recall,
-        f1,
-        cm,
-        predictions,
+        float(precision),
+        float(recall),
+        float(f1),
     )
 
+
+# ============================================================
+# ROC AUC
+# ============================================================
 
 def roc_auc_manual(
     y_true,
@@ -680,9 +2079,9 @@ def roc_auc_manual(
         len(positives) == 0
         or len(negatives) == 0
     ):
-        return 0.5
 
-    # Mann-Whitney formulation
+        return 0.0
+
     combined = np.concatenate(
         [
             positives,
@@ -691,17 +2090,19 @@ def roc_auc_manual(
     )
 
     order = np.argsort(
-        combined
+        combined,
+        kind="mergesort",
     )
 
-    ranks = np.empty_like(
-        order,
+    ranks = np.empty(
+        len(combined),
         dtype=np.float64,
     )
 
     ranks[order] = np.arange(
         1,
         len(combined) + 1,
+        dtype=np.float64,
     )
 
     positive_ranks = ranks[
@@ -718,7 +2119,7 @@ def roc_auc_manual(
                 len(positives)
                 + 1
             )
-            / 2
+            / 2.0
         )
     ) / (
         len(positives)
@@ -728,186 +2129,163 @@ def roc_auc_manual(
     return float(auc)
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
 
-def main():
+def confusion_matrix(
+    y_true,
+    predictions,
+):
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--data_dir",
-        required=True,
+    tn = int(
+        np.sum(
+            (
+                y_true == 0
+            )
+            & (
+                predictions == 0
+            )
+        )
     )
 
-    parser.add_argument(
-        "--out",
-        default="../lib/model_weights.json",
+    fp = int(
+        np.sum(
+            (
+                y_true == 0
+            )
+            & (
+                predictions == 1
+            )
+        )
     )
 
-    args = parser.parse_args()
-
-    # -----------------------------------------------------
-    # Load dataset
-    # -----------------------------------------------------
-
-    X, y, paths = load_dataset(
-        args.data_dir
+    fn = int(
+        np.sum(
+            (
+                y_true == 1
+            )
+            & (
+                predictions == 0
+            )
+        )
     )
 
-    if len(X) < 20:
-        raise RuntimeError(
-            "Dataset is too small."
+    tp = int(
+        np.sum(
+            (
+                y_true == 1
+            )
+            & (
+                predictions == 1
+            )
+        )
+    )
+
+    return np.array(
+        [
+            [tn, fp],
+            [fn, tp],
+        ],
+        dtype=np.int64,
+    )
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+def save_checkpoint(
+    path,
+    W1,
+    b1,
+    W2,
+    b2,
+    mean,
+    std,
+    epoch,
+    validation_loss,
+):
+
+    path = Path(
+        path
+    )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    checkpoint = {
+        "epoch":
+            int(epoch),
+
+        "validationLoss":
+            float(validation_loss),
+
+        "W1":
+            W1.tolist(),
+
+        "b1":
+            b1.tolist(),
+
+        "W2":
+            W2.tolist(),
+
+        "b2":
+            b2.tolist(),
+
+        "mean":
+            mean.tolist(),
+
+        "std":
+            std.tolist(),
+    }
+
+    temp_path = (
+        path.with_suffix(
+            ".tmp"
+        )
+    )
+
+    with open(
+        temp_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            checkpoint,
+            f,
         )
 
-    # -----------------------------------------------------
-    # Split
-    # -----------------------------------------------------
-
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-    ) = train_test_split_manual(
-        X,
-        y,
-        test_size=0.20,
-        seed=RANDOM_SEED,
+    temp_path.replace(
+        path
     )
 
-    print()
-    print(
-        f"Training samples: "
-        f"{len(X_train)}"
+
+# ============================================================
+# EXPORT FINAL MODEL
+# ============================================================
+
+def export_model(
+    output_path,
+    W1,
+    b1,
+    W2,
+    b2,
+    mean,
+    std,
+):
+
+    output_path = Path(
+        output_path
     )
 
-    print(
-        f"Test samples:     "
-        f"{len(X_test)}"
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-
-    # -----------------------------------------------------
-    # Standardization
-    # -----------------------------------------------------
-
-    mean, std = fit_scaler(
-        X_train
-    )
-
-    X_train_scaled = standardize(
-        X_train,
-        mean,
-        std,
-    )
-
-    X_test_scaled = standardize(
-        X_test,
-        mean,
-        std,
-    )
-
-    # -----------------------------------------------------
-    # Train
-    # -----------------------------------------------------
-
-    print()
-    print("=" * 60)
-    print("TRAINING NUMPY MLP")
-    print("=" * 60)
-
-    W1, b1, W2, b2 = train_model(
-        X_train_scaled,
-        y_train,
-        input_dim=len(FEATURE_NAMES),
-        hidden_dim=HIDDEN_UNITS,
-        learning_rate=LEARNING_RATE,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        l2=L2,
-        seed=RANDOM_SEED,
-    )
-
-    # -----------------------------------------------------
-    # Test
-    # -----------------------------------------------------
-
-    _, _, probabilities = forward(
-        X_test_scaled,
-        W1,
-        b1,
-        W2,
-        b2,
-    )
-
-    (
-        accuracy,
-        precision,
-        recall,
-        f1,
-        cm,
-        predictions,
-    ) = binary_metrics(
-        y_test,
-        probabilities,
-    )
-
-    auc = roc_auc_manual(
-        y_test,
-        probabilities,
-    )
-
-    # -----------------------------------------------------
-    # Evaluation
-    # -----------------------------------------------------
-
-    print()
-    print("=" * 60)
-    print("MODEL EVALUATION")
-    print("=" * 60)
-
-    print(
-        f"Accuracy : {accuracy:.4f}"
-    )
-
-    print(
-        f"AUC      : {auc:.4f}"
-    )
-
-    print(
-        f"Precision: {precision:.4f}"
-    )
-
-    print(
-        f"Recall   : {recall:.4f}"
-    )
-
-    print(
-        f"F1       : {f1:.4f}"
-    )
-
-    print()
-    print("Confusion matrix:")
-    print(cm)
-
-    print()
-
-    if accuracy >= 0.999 and auc >= 0.999:
-
-        print("⚠️ WARNING")
-        print(
-            "Accuracy and AUC are almost perfect."
-        )
-
-        print(
-            "This may indicate dataset leakage "
-            "or source-specific artifacts."
-        )
-
-    # -----------------------------------------------------
-    # Export
-    # -----------------------------------------------------
 
     output = {
 
@@ -940,20 +2318,26 @@ def main():
         ],
 
         "version":
-            "trained-numpy-v3",
+            MODEL_VERSION,
+
+        "sampleRate":
+            TARGET_SAMPLE_RATE,
+
+        "audioFormats":
+            [
+                "wav",
+                "mp3",
+            ],
     }
 
-    output_path = Path(
-        args.out
-    )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+    temp_path = (
+        output_path.with_suffix(
+            ".tmp"
+        )
     )
 
     with open(
-        output_path,
+        temp_path,
         "w",
         encoding="utf-8",
     ) as f:
@@ -964,19 +2348,637 @@ def main():
             indent=2,
         )
 
+    temp_path.replace(
+        output_path
+    )
+
     print()
     print(
-        f"Wrote {output_path}"
+        f"✓ Model written to:"
     )
 
     print(
-        f"Input dimensions: "
+        f"  {output_path}"
+    )
+
+
+# ============================================================
+# FINAL EVALUATION
+# ============================================================
+
+def final_evaluation(
+    features,
+    labels,
+    valid_mask,
+    validation_indices,
+    mean,
+    std,
+    W1,
+    b1,
+    W2,
+    b2,
+    batch_size,
+    positive_weight,
+    negative_weight,
+):
+
+    usable_indices = (
+        validation_indices[
+            np.asarray(
+                valid_mask[
+                    validation_indices
+                ],
+                dtype=bool,
+            )
+        ]
+    )
+
+    y_true = []
+    probabilities = []
+
+    for start in range(
+        0,
+        len(usable_indices),
+        batch_size,
+    ):
+
+        end = min(
+            start + batch_size,
+            len(usable_indices),
+        )
+
+        batch_indices = (
+            usable_indices[
+                start:end
+            ]
+        )
+
+        X = np.asarray(
+            features[
+                batch_indices
+            ],
+            dtype=np.float32,
+        )
+
+        y = np.asarray(
+            labels[
+                batch_indices
+            ],
+            dtype=np.int64,
+        )
+
+        X = standardize(
+            X,
+            mean,
+            std,
+        )
+
+        (
+            _,
+            _,
+            prob,
+        ) = forward(
+            X,
+            W1,
+            b1,
+            W2,
+            b2,
+        )
+
+        y_true.extend(
+            y.tolist()
+        )
+
+        probabilities.extend(
+            prob.tolist()
+        )
+
+    y_true = np.asarray(
+        y_true,
+        dtype=np.int64,
+    )
+
+    probabilities = np.asarray(
+        probabilities,
+        dtype=np.float32,
+    )
+
+    predictions = (
+        probabilities >= 0.5
+    ).astype(
+        np.int64
+    )
+
+    accuracy = float(
+        np.mean(
+            predictions
+            == y_true
+        )
+    )
+
+    (
+        precision,
+        recall,
+        f1,
+    ) = calculate_precision_recall_f1(
+        y_true,
+        predictions,
+    )
+
+    auc = roc_auc_manual(
+        y_true,
+        probabilities,
+    )
+
+    cm = confusion_matrix(
+        y_true,
+        predictions,
+    )
+
+    print()
+    print("=" * 70)
+    print("FINAL VALIDATION")
+    print("=" * 70)
+
+    print(
+        f"Samples  : {len(y_true):,}"
+    )
+
+    print(
+        f"Accuracy : {accuracy:.4f}"
+    )
+
+    print(
+        f"AUC      : {auc:.4f}"
+    )
+
+    print(
+        f"Precision: {precision:.4f}"
+    )
+
+    print(
+        f"Recall   : {recall:.4f}"
+    )
+
+    print(
+        f"F1       : {f1:.4f}"
+    )
+
+    print()
+    print(
+        "Confusion matrix:"
+    )
+
+    print(
+        "              Predicted"
+    )
+
+    print(
+        "              Bona  Spoof"
+    )
+
+    print(
+        f"Actual Bona   "
+        f"{cm[0, 0]:6d} "
+        f"{cm[0, 1]:6d}"
+    )
+
+    print(
+        f"Actual Spoof  "
+        f"{cm[1, 0]:6d} "
+        f"{cm[1, 1]:6d}"
+    )
+
+    return {
+        "accuracy":
+            accuracy,
+
+        "auc":
+            auc,
+
+        "precision":
+            precision,
+
+        "recall":
+            recall,
+
+        "f1":
+            f1,
+
+        "confusionMatrix":
+            cm.tolist(),
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "VoiceGuard production-oriented "
+            "WAV/MP3 streaming classifier."
+        )
+    )
+
+    parser.add_argument(
+        "--data_dir",
+        required=True,
+        help=(
+            "Dataset containing "
+            "bonafide/ and spoof/"
+        ),
+    )
+
+    parser.add_argument(
+        "--out",
+        default="../lib/model_weights.json",
+    )
+
+    parser.add_argument(
+        "--cache_dir",
+        default="../cache/features",
+    )
+
+    parser.add_argument(
+        "--checkpoint",
+        default="../cache/checkpoint.json",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=EPOCHS,
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=BATCH_SIZE,
+    )
+
+    parser.add_argument(
+        "--hidden_units",
+        type=int,
+        default=HIDDEN_UNITS,
+    )
+
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=LEARNING_RATE,
+    )
+
+    parser.add_argument(
+        "--validation_size",
+        type=float,
+        default=VALIDATION_SIZE,
+    )
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
+
+    if args.batch_size <= 0:
+        raise ValueError(
+            "batch_size must be > 0"
+        )
+
+    if args.epochs <= 0:
+        raise ValueError(
+            "epochs must be > 0"
+        )
+
+    if not (
+        0.0
+        < args.validation_size
+        < 1.0
+    ):
+
+        raise ValueError(
+            "validation_size must be "
+            "between 0 and 1"
+        )
+
+    # --------------------------------------------------------
+    # Header
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("VOICEGUARD AUDIO CLASSIFIER")
+    print("=" * 70)
+
+    print(
+        "Production streaming configuration"
+    )
+
+    print(
+        f"Sample rate : "
+        f"{TARGET_SAMPLE_RATE} Hz"
+    )
+
+    print(
+        f"Batch size  : "
+        f"{args.batch_size}"
+    )
+
+    print(
+        f"Epochs      : "
+        f"{args.epochs}"
+    )
+
+    print(
+        f"Features    : "
         f"{len(FEATURE_NAMES)}"
     )
 
     print(
         f"Hidden units: "
-        f"{len(b1)}"
+        f"{args.hidden_units}"
+    )
+
+    # --------------------------------------------------------
+    # Discover
+    # --------------------------------------------------------
+
+    paths, labels = (
+        discover_dataset(
+            args.data_dir
+        )
+    )
+
+    # --------------------------------------------------------
+    # Split paths/indices BEFORE feature extraction
+    #
+    # This means the validation set never affects the
+    # training scaler.
+    # --------------------------------------------------------
+
+    (
+        train_indices,
+        validation_indices,
+    ) = stratified_split(
+        paths,
+        labels,
+        validation_size=args.validation_size,
+        seed=RANDOM_SEED,
+    )
+
+    print()
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Training files:   "
+        f"{len(train_indices):,}"
+    )
+
+    print(
+        f"Validation files: "
+        f"{len(validation_indices):,}"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    # --------------------------------------------------------
+    # Build / reuse disk feature cache
+    # --------------------------------------------------------
+
+    cache_files = (
+        build_feature_cache(
+            paths,
+            labels,
+            args.cache_dir,
+            len(FEATURE_NAMES),
+        )
+    )
+
+    # --------------------------------------------------------
+    # Open memory-mapped features
+    # --------------------------------------------------------
+
+    (
+        features,
+        cached_labels,
+        valid_mask,
+    ) = open_feature_cache(
+        args.cache_dir,
+        len(paths),
+        len(FEATURE_NAMES),
+    )
+
+    # Safety check
+    if not np.array_equal(
+        np.asarray(cached_labels),
+        labels,
+    ):
+
+        raise RuntimeError(
+            "Cached labels do not match "
+            "current dataset."
+        )
+
+    # --------------------------------------------------------
+    # Fit scaler ONLY on training data
+    # --------------------------------------------------------
+
+    (
+        mean,
+        std,
+        valid_train_count,
+    ) = fit_scaler(
+        features,
+        train_indices,
+        valid_mask,
+        args.batch_size,
+    )
+
+    print()
+    print(
+        f"Scaler training samples: "
+        f"{valid_train_count:,}"
+    )
+
+    # --------------------------------------------------------
+    # Train
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("TRAINING")
+    print("=" * 70)
+
+    (
+        W1,
+        b1,
+        W2,
+        b2,
+    ) = train_model(
+        features=features,
+        labels=cached_labels,
+        valid_mask=valid_mask,
+        train_indices=train_indices,
+        validation_indices=validation_indices,
+        mean=mean,
+        std=std,
+        hidden_units=args.hidden_units,
+        learning_rate=args.learning_rate,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        l2=L2,
+        seed=RANDOM_SEED,
+        checkpoint_path=args.checkpoint,
+    )
+
+    # --------------------------------------------------------
+    # Final evaluation
+    # --------------------------------------------------------
+
+    final_metrics = final_evaluation(
+        features,
+        cached_labels,
+        valid_mask,
+        validation_indices,
+        mean,
+        std,
+        W1,
+        b1,
+        W2,
+        b2,
+        args.batch_size,
+        1.0,
+        1.0,
+    )
+
+    # --------------------------------------------------------
+    # Export
+    # --------------------------------------------------------
+
+    export_model(
+        args.out,
+        W1,
+        b1,
+        W2,
+        b2,
+        mean,
+        std,
+    )
+
+    # --------------------------------------------------------
+    # Save training metadata
+    # --------------------------------------------------------
+
+    metadata_path = Path(
+        args.out
+    ).with_name(
+        "training_metadata.json"
+    )
+
+    metadata = {
+        "datasetFiles":
+            int(len(paths)),
+
+        "validFiles":
+            int(np.sum(valid_mask)),
+
+        "skippedFiles":
+            int(
+                len(paths)
+                - np.sum(valid_mask)
+            ),
+
+        "trainingFiles":
+            int(len(train_indices)),
+
+        "validationFiles":
+            int(
+                len(validation_indices)
+            ),
+
+        "validTrainingFiles":
+            int(
+                np.sum(
+                    valid_mask[
+                        train_indices
+                    ]
+                )
+            ),
+
+        "validValidationFiles":
+            int(
+                np.sum(
+                    valid_mask[
+                        validation_indices
+                    ]
+                )
+            ),
+
+        "featureDimension":
+            int(len(FEATURE_NAMES)),
+
+        "sampleRate":
+            TARGET_SAMPLE_RATE,
+
+        "batchSize":
+            args.batch_size,
+
+        "epochs":
+            args.epochs,
+
+        "learningRate":
+            args.learning_rate,
+
+        "hiddenUnits":
+            args.hidden_units,
+
+        "validationSize":
+            args.validation_size,
+
+        "metrics":
+            final_metrics,
+    }
+
+    with open(
+        metadata_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=2,
+        )
+
+    print()
+    print("=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Model:    {args.out}"
+    )
+
+    print(
+        f"Cache:    {args.cache_dir}"
+    )
+
+    print(
+        f"Metadata: {metadata_path}"
+    )
+
+    print()
+    print(
+        "The feature cache can be reused on "
+        "future training runs."
     )
 
 

@@ -1,0 +1,33 @@
+{
+  "datasetFiles": 53882,
+  "validFiles": 53868,
+  "skippedFiles": 14,
+  "trainingFiles": 43106,
+  "validationFiles": 10776,
+  "validTrainingFiles": 43094,
+  "validValidationFiles": 10774,
+  "featureDimension": 45,
+  "sampleRate": 16000,
+  "batchSize": 64,
+  "epochs": 50,
+  "learningRate": 0.001,
+  "hiddenUnits": 16,
+  "validationSize": 0.2,
+  "metrics": {
+    "accuracy": 0.9629664005940226,
+    "auc": 0.9912334929762361,
+    "precision": 0.9582797279911781,
+    "recall": 0.968065354623097,
+    "f1": 0.9631476863397064,
+    "confusionMatrix": [
+      [
+        5161,
+        227
+      ],
+      [
+        172,
+        5214
+      ]
+    ]
+  }
+}
