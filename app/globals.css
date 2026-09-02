@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  background: #0b0f14;
+  color: #e5eef5;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #232c3a; border-radius: 4px; }
+
+.card {
+  background: #121821;
+  border: 1px solid #232c3a;
+  border-radius: 14px;
+}
+
+@keyframes pulseRing {
+  0% { box-shadow: 0 0 0 0 rgba(248,113,113,0.45); }
+  100% { box-shadow: 0 0 0 14px rgba(248,113,113,0); }
+}
+.pulse-danger { animation: pulseRing 1.4s ease-out infinite; }
