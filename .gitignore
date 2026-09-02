@@ -1,8 +1,21 @@
-node_modules/
-.next/
-out/
-.env*.local
-.vercel
-*.log
+# Python
+venv/
+.venv/
 __pycache__/
 *.pyc
+
+# Next.js
+.next/
+out/
+
+# Node
+node_modules/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# OS
+.DS_Store
+Thumbs.db
