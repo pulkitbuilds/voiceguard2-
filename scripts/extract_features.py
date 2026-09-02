@@ -71,27 +71,51 @@ def _magnitude_spectrum(frame_windowed):
 
 
 def _estimate_pitch(frame, sample_rate, min_hz=70, max_hz=400):
-    """Autocorrelation pitch tracker -- direct port of estimatePitch() in
-    lib/audioFeatures.js (same confidence threshold, same lag search)."""
+    """Fast autocorrelation pitch tracker.
+
+    Keeps the same lag range and confidence calculation as the JS version,
+    but computes all lag correlations using FFT-based autocorrelation.
+    """
     n = len(frame)
+
     max_lag = int(sample_rate / min_hz)
     min_lag = int(sample_rate / max_hz)
+
     energy = np.sum(frame ** 2)
     if energy < 1e-9:
         return None
 
-    best_lag, best_val = -1, 0.0
     upper = min(max_lag, n - 1)
-    for lag in range(min_lag, upper + 1):
-        s = np.dot(frame[: n - lag], frame[lag:])
-        norm = s / (n - lag)
-        if norm > best_val:
-            best_val, best_lag = norm, lag
-    if best_lag <= 0:
+    if min_lag > upper:
         return None
+
+    # FFT-based autocorrelation.
+    # Zero-pad to avoid circular convolution.
+    fft_size = 1 << int(np.ceil(np.log2(2 * n - 1)))
+
+    spectrum = np.fft.rfft(frame, n=fft_size)
+    autocorr = np.fft.irfft(
+        spectrum * np.conjugate(spectrum),
+        n=fft_size
+    )
+
+    # Same normalization used by the original implementation:
+    # dot(frame[:n-lag], frame[lag:]) / (n-lag)
+    lags = np.arange(min_lag, upper + 1)
+    vals = autocorr[lags] / (n - lags)
+
+    best_idx = np.argmax(vals)
+    best_lag = int(lags[best_idx])
+    best_val = float(vals[best_idx])
+
+    if best_val <= 0:
+        return None
+
     confidence = best_val / (energy / n)
+
     if confidence < 0.3:
         return None
+
     return sample_rate / best_lag
 
 
