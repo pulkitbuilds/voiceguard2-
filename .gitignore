@@ -19,3 +19,10 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Dataset
+dataset/
+data/
+*.wav
+*.mp3
+*.flac
